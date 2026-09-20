@@ -1,0 +1,16 @@
+{
+  "short_name": "收纳盒",
+  "name": "极简智能物品收纳助手",
+  "icons": [
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ],
+  "start_url": "index.html",
+  "background_color": "#f8f9fa",
+  "theme_color": "#007aff",
+  "display": "standalone",
+  "orientation": "portrait"
+}
