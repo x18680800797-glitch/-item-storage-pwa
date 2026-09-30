@@ -137,9 +137,9 @@ const db = new DBManager();
 // --- 2. IMAGE COMPRESSION UTILITY ---
 /**
  * Automatically compresses an image file to standard sizes for storage.
- * Max dimension: 1024px, JPEG Format, Quality: 0.75
+ * Max dimension: 1280px, JPEG Format, Quality: 0.8
  */
-async function compressImage(file, maxWidth = 1024, maxHeight = 1024, quality = 0.75) {
+async function compressImage(file, maxWidth = 1280, maxHeight = 1280, quality = 0.8) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = (e) => {
