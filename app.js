@@ -251,6 +251,7 @@ const btnRemoveFar = document.getElementById('btn-remove-far');
 const detailModal = document.getElementById('detail-modal');
 const btnDetailClose = document.getElementById('btn-detail-close');
 const btnDetailEdit = document.getElementById('btn-detail-edit');
+const btnDetailDelete = document.getElementById('btn-detail-delete');
 const detailImgClose = document.getElementById('detail-img-close');
 const detailImgFar = document.getElementById('detail-img-far');
 const detailImgClosePlaceholder = document.getElementById('detail-img-close-placeholder');
@@ -760,6 +761,23 @@ async function handleEditDelete() {
   }
 }
 
+async function handleDetailDelete() {
+  if (!activeViewItem) return;
+
+  const confirmed = confirm(`确定要彻底删除“${activeViewItem.name || '该物品'}”吗？`);
+  if (!confirmed) return;
+
+  try {
+    await db.delete(activeViewItem.id);
+    closeModal(detailModal);
+    loadInventory();
+    showToast('物品已删除');
+  } catch (err) {
+    console.error('Failed to delete item:', err);
+    showToast('删除失败');
+  }
+}
+
 
 // --- 12. EVENT LISTENERS SETUP ---
 
@@ -836,6 +854,7 @@ btnRemoveFar.addEventListener('click', (e) => {
 // Detail Modal Events
 btnDetailClose.addEventListener('click', () => closeModal(detailModal));
 btnDetailEdit.addEventListener('click', openEditModalFromDetail);
+btnDetailDelete.addEventListener('click', handleDetailDelete);
 
 // Edit Modal Events (Phase 3)
 btnEditCancel.addEventListener('click', () => {
