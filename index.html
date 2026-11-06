@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-app-release="manual-backup-20261106-1">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, maximum-scale=1.0, user-scalable=no">
@@ -11,21 +11,69 @@
   <meta name="apple-mobile-web-app-title" content="收纳盒">
   <link rel="apple-touch-icon" href="icon.svg">
   
-  <link rel="stylesheet" href="app.css">
+  <!-- This bootstrap must work even when SRI blocks the main script. -->
+  <script>
+  (() => {
+    function notice(message, fatal = false) {
+      if (fatal) document.documentElement.dataset.appReleaseBlocked = 'true';
+      if (!fatal && document.documentElement.dataset.appReleaseBlocked === 'true') return;
+      const show = () => {
+        const element = document.getElementById('app-update-status');
+        element.textContent = message;
+        element.hidden = false;
+      };
+      if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', show, { once: true });
+      else show();
+    }
+    window.shounaReleaseNotice = notice;
+    window.addEventListener('error', event => {
+      if (event.target instanceof Element && event.target.hasAttribute('data-release-resource')) {
+        notice('页面资源更新未完成，已暂停加载。请联网后关闭并重新打开应用；不会自动刷新或清除数据。', true);
+      }
+    }, true);
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', async () => {
+        try {
+          const registration = await navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' });
+          const waiting = () => notice('新版离线资源已准备好。完成当前操作后，关闭本应用的所有窗口再打开即可更新；不会自动刷新。');
+          const watch = worker => {
+            if (!worker) return;
+            worker.addEventListener('statechange', () => {
+              if (worker.state === 'installed' && registration.waiting) waiting();
+              if (worker.state === 'redundant') notice('本次离线更新未完成，未强制切换版本。请保持联网，稍后重新打开应用。');
+            });
+          };
+          if (registration.waiting) waiting();
+          watch(registration.installing);
+          registration.addEventListener('updatefound', () => watch(registration.installing));
+        } catch (error) {
+          console.error('Service Worker registration failed:', error);
+          notice('离线更新检查未完成。当前页面不会自动刷新，请保持联网后重试。');
+        }
+      });
+    }
+  })();
+  </script>
+
+  <link rel="stylesheet" href="app.css?v=manual-backup-20261106-1" integrity="sha256-wclueLtuzbGWP2Lq/PjdjRRHPEIRURKh5HsWWIRwt7Q=" data-release-resource>
   
-  <!-- Use CDN for pinyin-match and fallback in sw.js for caching -->
-  <script src="https://cdn.jsdelivr.net/npm/pinyin-match/dist/main.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/fuse.js@6.6.2/dist/fuse.min.js"></script>
+  <!-- Fixed CDN bytes are verified by SRI and by the release cache. -->
+  <script src="https://cdn.jsdelivr.net/npm/pinyin-match@1.2.10/dist/main.js" integrity="sha256-EfvwJyf265DYQqPpwp7aGRs44pO/ASAnVufXvpSGfuc=" crossorigin="anonymous" data-release-resource></script>
+  <script src="https://cdn.jsdelivr.net/npm/fuse.js@6.6.2/dist/fuse.min.js" integrity="sha256-xXM5w/oWsdadmmtGdJqBOe+NT8m7/kgUT/iXqn1CIuw=" crossorigin="anonymous" data-release-resource></script>
 </head>
 <body>
+  <p id="app-update-status" role="status" hidden style="margin: 12px 16px; line-height: 1.6;"></p>
   <div class="container">
     <!-- Main Screen Header -->
     <header>
       <h1>收纳助手</h1>
+      <div class="header-actions">
+      <button class="btn btn-secondary" id="btn-backup-trigger" type="button">备份</button>
       <button class="btn btn-primary" id="btn-add-trigger">
         <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 4px;"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
         新增
       </button>
+      </div>
     </header>
 
     <!-- Search Input Bar -->
@@ -233,11 +281,43 @@
     </div>
   </div>
 
+  <!-- Manual backup: export and verification only; never restores data. -->
+  <div class="modal-overlay" id="backup-modal" data-close-on-click-outside="false">
+    <section class="modal-content" role="dialog" aria-modal="true" aria-labelledby="backup-title">
+      <div class="backup-heading">
+        <h2 id="backup-title" class="modal-title">备份与核验</h2>
+        <button class="btn btn-secondary" id="btn-backup-close" type="button">关闭</button>
+      </div>
+      <p class="backup-note">只导出当前入口的数据，不会修改物品。每隔 3—5 天，请分别从广安、远达入口备份。</p>
+      <label class="form-label" for="backup-family">请手动确认：当前正在操作哪份数据？</label>
+      <select class="form-input" id="backup-family">
+        <option value="">请选择家庭</option>
+        <option value="广安">广安</option>
+        <option value="远达">远达</option>
+      </select>
+      <p class="backup-note">应用不能识别桌面入口名称。照片按数据库现存内容完整保留，不再次压缩。</p>
+      <div class="backup-actions">
+        <button class="btn btn-primary" id="btn-backup-generate" type="button">生成完整备份</button>
+        <button class="btn btn-primary" id="btn-backup-share" type="button" hidden>系统分享 / 存储到文件</button>
+        <button class="btn btn-secondary" id="btn-backup-download" type="button" hidden>下载备份（备用）</button>
+      </div>
+      <p id="backup-status" class="backup-status" role="status" aria-live="polite">请选择家庭后生成备份。也可以直接选择旧备份核验。</p>
+      <div class="backup-verify">
+        <h3 class="form-label">重新选择文件并核验</h3>
+        <p class="backup-note">只检查文件，不导入或恢复。大文件核验可能占用较多内存，请保持应用在前台。</p>
+        <label class="form-label" for="backup-file">选择已保存的 JSON 备份</label>
+        <input id="backup-file" class="form-input" type="file" accept=".json,application/json">
+        <button class="btn btn-secondary" id="btn-backup-verify" type="button" disabled>核验所选文件</button>
+      </div>
+      <p class="backup-note">分享或下载结束不代表文件已经保存。重新读取通过也不能证明 iCloud 已同步，请在“文件”中检查。备份包含照片和位置，请妥善保管。</p>
+    </section>
+  </div>
+
   <!-- Toast Element -->
   <div class="toast" id="toast">提示信息</div>
 
   <!-- Scripts -->
-  <script src="search.js"></script>
-  <script src="app.js"></script>
+  <script src="search.js?v=manual-backup-20261106-1" integrity="sha256-MUYcAhO0JMqwYG/MqkLF0fMS+9JkU52fq3QnHiqOiUU=" data-release-resource></script>
+  <script src="app.js?v=manual-backup-20261106-1" integrity="sha256-poaSJvD64w7cZYKNfHeVu8wiywNEy8Z/kjVhLbmHLWs=" data-release-resource></script>
 </body>
 </html>

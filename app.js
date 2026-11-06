@@ -1,3 +1,28 @@
+// Prevent a new script from initializing against an old/corrupt document.
+(() => {
+  const release = 'manual-backup-20261106-1';
+  if (document.documentElement.dataset.appRelease !== release || document.documentElement.dataset.appReleaseBlocked === 'true') {
+    const message = '页面与程序版本不一致或资源不完整，已暂停初始化。请联网后关闭并重新打开应用；不会自动刷新或清除数据。';
+    if (window.shounaReleaseNotice) window.shounaReleaseNotice(message, true);
+    else {
+      const show = () => {
+        const note = document.createElement('p');
+        note.setAttribute('role', 'alert');
+        note.textContent = message;
+        document.body.prepend(note);
+      };
+      if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', show, { once: true });
+      else show();
+      // Legacy HTML has no independent bootstrap. Still allow a safe SW update.
+      if ('serviceWorker' in navigator) window.addEventListener('load', () => {
+        navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' }).catch(console.error);
+      }, { once: true });
+    }
+    throw new Error(message);
+  }
+  document.documentElement.dataset.appCodeRelease = release;
+})();
+
 /**
  * Core application logic for Minimal Item Storage PWA
  */
@@ -6,6 +31,16 @@
 const DB_NAME = 'ItemStorageDB';
 const DB_VERSION = 1;
 const STORE_NAME = 'items';
+
+// Backup safety observers; no data or transaction behavior is changed.
+let pendingItemWrites = 0;
+let pendingPhotoJobs = 0;
+function observeItemWrite(transaction) {
+  pendingItemWrites++;
+  const finished = () => { pendingItemWrites--; };
+  transaction.addEventListener('complete', finished, { once: true });
+  transaction.addEventListener('abort', finished, { once: true });
+}
 
 class DBManager {
   constructor() {
@@ -75,6 +110,7 @@ class DBManager {
     return new Promise((resolve, reject) => {
       if (!this.db) return reject('Database not initialized');
       const transaction = this.db.transaction(STORE_NAME, 'readwrite');
+      observeItemWrite(transaction);
       const store = transaction.objectStore(STORE_NAME);
       
       const cleanItem = {
@@ -98,6 +134,7 @@ class DBManager {
     return new Promise((resolve, reject) => {
       if (!this.db) return reject('Database not initialized');
       const transaction = this.db.transaction(STORE_NAME, 'readwrite');
+      observeItemWrite(transaction);
       const store = transaction.objectStore(STORE_NAME);
       
       const cleanItem = {
@@ -122,6 +159,7 @@ class DBManager {
     return new Promise((resolve, reject) => {
       if (!this.db) return reject('Database not initialized');
       const transaction = this.db.transaction(STORE_NAME, 'readwrite');
+      observeItemWrite(transaction);
       const store = transaction.objectStore(STORE_NAME);
       const request = store.delete(Number(id));
 
@@ -140,6 +178,7 @@ const db = new DBManager();
  * Max dimension: 1280px, JPEG Format, Quality: 0.8
  */
 async function compressImage(file, maxWidth = 1280, maxHeight = 1280, quality = 0.8) {
+  pendingPhotoJobs++;
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = (e) => {
@@ -177,7 +216,7 @@ async function compressImage(file, maxWidth = 1280, maxHeight = 1280, quality = 
     };
     reader.onerror = (err) => reject(err);
     reader.readAsDataURL(file);
-  });
+  }).finally(() => { pendingPhotoJobs--; });
 }
 
 
@@ -206,14 +245,8 @@ let inheritedLocation = ''; // Location inherited as placeholder
 let activeViewItem = null;
 
 
-// --- 5. REGISTER SERVICE WORKER FOR OFFLINE ---
-if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => {
-    navigator.serviceWorker.register('./sw.js')
-      .then((reg) => console.log('Service Worker registered with scope: ', reg.scope))
-      .catch((err) => console.error('Service Worker registration failed: ', err));
-  });
-}
+// --- 5. OFFLINE REGISTRATION ---
+// Registered independently in index.html so failed resource checks cannot block updates.
 
 
 // --- 6. DOM ELEMENTS ---
@@ -930,3 +963,290 @@ window.addEventListener('DOMContentLoaded', async () => {
     showToast('初始化数据库失败');
   }
 });
+
+// --- 14. MANUAL BACKUP EXPORT (format v1; no import/write operations) ---
+(() => {
+  'use strict';
+  const APP_ID = 'item-storage-assistant';
+  const FORMAT_VERSION = 1;
+  const ALGORITHM = 'SHA-256/canonical-json-v1';
+  // Canonical v1: JSON primitives; recursively sorted object keys; array order retained.
+  // Hash each canonical item; hash canonical {metadata, recordHashes} for the manifest.
+  const FIELDS = ['id', 'name', 'quantity', 'location', 'photoClose', 'photoFar', 'createdAt', 'updatedAt'];
+  const el = id => document.getElementById(id);
+  const modal = el('backup-modal');
+  const status = el('backup-status');
+  const family = el('backup-family');
+  const fileInput = el('backup-file');
+  const generate = el('btn-backup-generate');
+  const share = el('btn-backup-share');
+  const download = el('btn-backup-download');
+  const verify = el('btn-backup-verify');
+  const close = el('btn-backup-close');
+  let busy = false;
+  let generatedFile = null;
+  let downloadURL = null;
+  let lastFocus = null;
+  let shareTimedOut = false;
+
+  function canonical(value) {
+    if (Array.isArray(value)) return '[' + value.map(canonical).join(',') + ']';
+    if (value !== null && typeof value === 'object') {
+      return '{' + Object.keys(value).sort().map(key => JSON.stringify(key) + ':' + canonical(value[key])).join(',') + '}';
+    }
+    return JSON.stringify(value);
+  }
+  function requireKeys(value, keys, label) {
+    if (!value || typeof value !== 'object' || Array.isArray(value) ||
+        Object.keys(value).sort().join('|') !== [...keys].sort().join('|')) {
+      throw new Error(label + '字段不符合第一版格式，未忽略任何字段。');
+    }
+  }
+  async function digest(text) {
+    if (!globalThis.crypto?.subtle) throw new Error('当前环境不支持 SHA-256，请使用安全连接或本地测试地址。');
+    const hash = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+    return Array.from(new Uint8Array(hash), byte => byte.toString(16).padStart(2, '0')).join('');
+  }
+  function validateItem(item, label) {
+    requireKeys(item, FIELDS, label);
+    if (!Number.isSafeInteger(item.id) || item.id <= 0) throw new Error(label + ' ID 无效。');
+    if (typeof item.name !== 'string' || typeof item.location !== 'string') throw new Error(label + '名称或位置不是文本。');
+    if (item.quantity !== null && (typeof item.quantity !== 'number' || !Number.isFinite(item.quantity))) throw new Error(label + '数量无效。');
+    for (const key of ['createdAt', 'updatedAt']) {
+      if (!Number.isSafeInteger(item[key]) || item[key] < 0) throw new Error(label + ' ' + key + ' 无效。');
+    }
+    for (const key of ['photoClose', 'photoFar']) {
+      const photo = item[key];
+      if (photo === null) continue;
+      if (typeof photo !== 'string') throw new Error(label + ' ' + key + ' 不是照片字符串或 null。');
+      const match = /^data:image\/(?:jpeg|png|webp|gif);base64,([A-Za-z0-9+/]+={0,2})$/.exec(photo);
+      if (!match || match[1].length % 4 !== 0) throw new Error(label + ' ' + key + ' 编码不完整或格式不支持。');
+      try { atob(match[1]); } catch { throw new Error(label + ' ' + key + ' Base64 无效。'); }
+    }
+  }
+  function checkPhoto(photo, label) {
+    if (photo === null) return Promise.resolve();
+    return new Promise((resolve, reject) => {
+      const image = new Image();
+      const timer = setTimeout(() => finish(new Error(label + ' 解码超时，请重试。')), 30000);
+      function finish(error) {
+        clearTimeout(timer);
+        image.onload = image.onerror = null;
+        image.removeAttribute('src');
+        if (error) reject(error); else resolve();
+      }
+      image.onload = () => finish(image.naturalWidth && image.naturalHeight ? null : new Error(label + ' 图像尺寸无效。'));
+      image.onerror = () => finish(new Error(label + ' 无法解码，未跳过照片。'));
+      image.src = photo;
+    });
+  }
+  async function inspectItem(item, label) {
+    validateItem(item, label);
+    await checkPhoto(item.photoClose, label + '近景照片');
+    await checkPhoto(item.photoFar, label + '远景照片');
+  }
+  function assertReady() {
+    if (!db.db) throw new Error('数据库尚未初始化，请稍后重试。');
+    if (pendingItemWrites || pendingPhotoJobs || addModal.classList.contains('active') || editModal.classList.contains('active')) {
+      throw new Error('请先完成或取消当前录入、编辑，并等待照片处理和保存结束，再备份。');
+    }
+  }
+  function resetGenerated() {
+    generatedFile = null;
+    share.hidden = download.hidden = true;
+    if (downloadURL) { URL.revokeObjectURL(downloadURL); downloadURL = null; }
+  }
+  function setBusy(value) {
+    busy = value;
+    family.disabled = generate.disabled = fileInput.disabled = close.disabled = value;
+    share.disabled = download.disabled = value;
+    verify.disabled = value || !fileInput.files.length;
+  }
+  async function task(work) {
+    if (busy) return;
+    setBusy(true);
+    try { await work(); }
+    catch (error) {
+      status.textContent = '操作未完成：' + (error.message || String(error)) + '\n原数据库未被备份功能修改。';
+    } finally { setBusy(false); }
+  }
+
+  // Serialize one record at a time in ONE readonly snapshot. No createdAt index:
+  // even records missing an index value must be inspected, never silently omitted.
+  function readSnapshot() {
+    return new Promise((resolve, reject) => {
+      const parts = [];
+      let failure = null;
+      const tx = db.db.transaction(STORE_NAME, 'readonly');
+      tx.onabort = () => reject(failure || tx.error || new Error('读取事务中止。'));
+      tx.onerror = () => { failure = failure || tx.error; };
+      tx.oncomplete = () => resolve(parts);
+      const request = tx.objectStore(STORE_NAME).openCursor();
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor) return;
+        try {
+          validateItem(cursor.value, '记录 ' + cursor.primaryKey);
+          parts.push(canonical(cursor.value));
+          cursor.continue();
+        } catch (error) { failure = error; tx.abort(); }
+      };
+    });
+  }
+
+  el('btn-backup-trigger').addEventListener('click', () => {
+    if (busy) { showToast('备份任务仍在处理中。若系统分享一直未返回，请先检查文件，再重新打开应用。', 5000); return; }
+    try { assertReady(); }
+    catch (error) { showToast(error.message, 4000); return; }
+    lastFocus = document.activeElement;
+    if (!busy) {
+      resetGenerated();
+      family.value = '';
+      fileInput.value = '';
+      verify.disabled = true;
+      status.textContent = '请选择家庭后生成备份。也可以直接选择旧备份核验。';
+    }
+    openModal(modal);
+    family.focus();
+  });
+  close.addEventListener('click', () => {
+    if (busy && !shareTimedOut) return;
+    resetGenerated();
+    fileInput.value = '';
+    closeModal(modal);
+    lastFocus?.focus();
+  });
+  // Keep background controls unreachable, including keyboard navigation. Existing
+  // business handlers remain untouched; nothing is saved by opening this modal.
+  document.addEventListener('click', event => {
+    if (modal.classList.contains('active') && !modal.contains(event.target)) {
+      event.preventDefault(); event.stopImmediatePropagation();
+    }
+  }, true);
+  modal.addEventListener('keydown', event => {
+    if (event.key === 'Escape') { event.preventDefault(); if (!busy || shareTimedOut) close.click(); }
+    if (event.key !== 'Tab') return;
+    const controls = [...modal.querySelectorAll('button, select, input')].filter(node => !node.disabled && !node.hidden && node.getClientRects().length);
+    if (!controls.length) { event.preventDefault(); return; }
+    const first = controls[0], last = controls[controls.length - 1];
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+    if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+  });
+  family.addEventListener('change', () => {
+    resetGenerated();
+    status.textContent = family.value ? '当前操作：' + family.value + '（由你确认）。请确认来自正确桌面入口。' : '请手动选择家庭。';
+  });
+
+  generate.addEventListener('click', () => task(async () => {
+    assertReady();
+    if (!['广安', '远达'].includes(family.value)) throw new Error('请先手动选择广安或远达。');
+    resetGenerated();
+    status.textContent = '正在读取当前入口的全部记录，请保持应用在前台…';
+    const parts = await readSnapshot();
+    const recordHashes = [];
+    let closeCount = 0, farCount = 0;
+    for (let i = 0; i < parts.length; i++) {
+      const item = JSON.parse(parts[i]);
+      status.textContent = '正在检查记录和照片：' + (i + 1) + '/' + parts.length;
+      await inspectItem(item, '记录 ' + item.id);
+      if (item.photoClose !== null) closeCount++;
+      if (item.photoFar !== null) farCount++;
+      recordHashes.push(await digest(parts[i]));
+    }
+    const now = new Date();
+    const metadata = {
+      appId: APP_ID, formatVersion: FORMAT_VERSION, familyName: family.value,
+      exportedAt: now.toISOString(),
+      database: { name: DB_NAME, version: db.db.version, store: STORE_NAME, keyPath: 'id', autoIncrement: true, indexes: [{ name: 'createdAt', keyPath: 'createdAt', unique: false }] },
+      counts: { records: parts.length, photoClose: closeCount, photoFar: farCount }
+    };
+    const integrity = { algorithm: ALGORITHM, recordHashes, manifestHash: await digest(canonical({ metadata, recordHashes })) };
+    // Compose one JSON document without joining all records into a giant string.
+    for (let i = 1; i < parts.length; i++) parts[i] = ',' + parts[i];
+    const pad = number => String(number).padStart(2, '0');
+    const date = [now.getFullYear(), pad(now.getMonth() + 1), pad(now.getDate())].join('-');
+    const time = [pad(now.getHours()), pad(now.getMinutes()), pad(now.getSeconds())].join('');
+    generatedFile = new File(['{"metadata":', canonical(metadata), ',"items":[', ...parts, '],"integrity":', canonical(integrity), '}'],
+      '收纳助手_' + family.value + '_' + date + '_' + time + '.json', { type: 'application/json' });
+    let canShare = false;
+    try { canShare = !!navigator.share && !!navigator.canShare?.({ files: [generatedFile] }); } catch { /* Download remains available. */ }
+    share.hidden = !canShare;
+    download.hidden = false;
+    status.textContent = '文件已生成，尚未确认保存。\n当前数据：' + family.value + '\n' + parts.length + ' 条记录；近景 ' + closeCount + ' 张，远景 ' + farCount + ' 张。\n文件大小：' + (generatedFile.size / 1024 / 1024).toFixed(2) + ' MiB。\n' +
+      (canShare ? '请选择系统分享或下载，再重新选择文件核验。' : '此环境未确认支持分享 JSON 文件，请使用当前入口内的下载备用方式。');
+  }));
+
+  share.addEventListener('click', () => task(async () => {
+    if (!generatedFile) throw new Error('请先生成备份。');
+    status.textContent = '系统分享处理中，请选择“存储到文件”。尚未确认保存或 iCloud 同步。';
+    shareTimedOut = false;
+    const timer = setTimeout(() => {
+      shareTimedOut = true;
+      status.textContent = '系统尚未返回分享结果，请先关闭系统分享面板。可以关闭此窗口继续使用原功能；若一直没有返回，请检查文件后重新打开应用，再核验备份。尚未确认保存。';
+      // A broken OS share callback must not permanently lock the application.
+      close.disabled = false;
+    }, 30000);
+    try {
+      // Directly invoked by this click, without preceding asynchronous work.
+      await navigator.share({ files: [generatedFile] });
+      status.textContent = '已交给系统处理，尚未确认文件保存。请在“文件”中检查并重新选择核验；应用无法确认 iCloud 同步状态。';
+    } catch (error) {
+      if (error.name === 'AbortError') status.textContent = '分享未完成，可能已取消或没有可用目标。尚未确认保存，可重试或下载。';
+      else throw new Error('系统分享未完成（' + error.name + '）：' + error.message + '。请检查“文件”，或使用下载备用方式。');
+    } finally { clearTimeout(timer); shareTimedOut = false; }
+  }));
+  download.addEventListener('click', () => {
+    if (busy || !generatedFile) return;
+    try {
+      if (downloadURL) URL.revokeObjectURL(downloadURL);
+      downloadURL = URL.createObjectURL(generatedFile);
+      const link = document.createElement('a');
+      link.href = downloadURL;
+      link.download = generatedFile.name;
+      modal.appendChild(link);
+      link.click(); link.remove();
+      status.textContent = '已发起下载，尚未确认保存。请在“文件”中检查，然后重新选择文件核验；应用无法确认 iCloud 同步状态。';
+    } catch (error) { status.textContent = '下载未启动：' + error.message; }
+  });
+
+  fileInput.addEventListener('change', () => {
+    verify.disabled = busy || !fileInput.files.length;
+    if (fileInput.files.length) status.textContent = '已选择 ' + fileInput.files[0].name + '（' + (fileInput.files[0].size / 1024 / 1024).toFixed(2) + ' MiB）。核验不会恢复或修改数据库；大文件需要较多内存。';
+  });
+  verify.addEventListener('click', () => task(async () => {
+    const selected = fileInput.files[0];
+    if (!selected) throw new Error('请先选择备份文件。');
+    // Release generated artifacts before whole-file parsing to reduce overlap.
+    resetGenerated();
+    status.textContent = '正在读取和核验文件，请保持应用在前台…';
+    let backup;
+    try { backup = JSON.parse(await selected.text()); }
+    catch { throw new Error('文件不是可读取的完整 JSON，可能已损坏或设备内存不足。'); }
+    requireKeys(backup, ['metadata', 'items', 'integrity'], '备份');
+    const { metadata, items, integrity } = backup;
+    requireKeys(metadata, ['appId', 'formatVersion', 'familyName', 'exportedAt', 'database', 'counts'], '元信息');
+    if (metadata.appId !== APP_ID || metadata.formatVersion !== FORMAT_VERSION) throw new Error('应用标识或备份版本不支持。');
+    if (!['广安', '远达'].includes(metadata.familyName) || typeof metadata.exportedAt !== 'string' || !Number.isFinite(Date.parse(metadata.exportedAt))) throw new Error('家庭或导出时间无效。');
+    const expectedDB = { name: DB_NAME, version: DB_VERSION, store: STORE_NAME, keyPath: 'id', autoIncrement: true, indexes: [{ name: 'createdAt', keyPath: 'createdAt', unique: false }] };
+    if (canonical(metadata.database) !== canonical(expectedDB)) throw new Error('数据库信息不符合第一版格式。');
+    requireKeys(metadata.counts, ['records', 'photoClose', 'photoFar'], '统计');
+    requireKeys(integrity, ['algorithm', 'recordHashes', 'manifestHash'], '校验信息');
+    if (!Array.isArray(items) || integrity.algorithm !== ALGORITHM || !Array.isArray(integrity.recordHashes) || integrity.recordHashes.length !== items.length) throw new Error('记录或校验清单无效。');
+    if (await digest(canonical({ metadata, recordHashes: integrity.recordHashes })) !== integrity.manifestHash) throw new Error('清单完整性校验不通过，文件可能被修改或损坏。');
+    const ids = new Set();
+    let closeCount = 0, farCount = 0;
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      status.textContent = '正在核验记录和照片：' + (i + 1) + '/' + items.length;
+      await inspectItem(item, '第 ' + (i + 1) + ' 条记录');
+      if (ids.has(item.id)) throw new Error('备份存在重复 ID：' + item.id);
+      ids.add(item.id);
+      if (await digest(canonical(item)) !== integrity.recordHashes[i]) throw new Error('记录 ' + item.id + ' 完整性校验不通过。');
+      if (item.photoClose !== null) closeCount++;
+      if (item.photoFar !== null) farCount++;
+    }
+    if (metadata.counts.records !== items.length || metadata.counts.photoClose !== closeCount || metadata.counts.photoFar !== farCount) throw new Error('记录数量或照片数量不一致。');
+    status.textContent = '所选备份文件完整，已核验。\n文件标注家庭：' + metadata.familyName + '（导出时人工确认）\n导出时间：' + metadata.exportedAt + '\n' + items.length + ' 条记录；近景 ' + closeCount + ' 张，远景 ' + farCount + ' 张。\n仅核验文件，未恢复数据；不能据此确认 iCloud 已同步。' +
+      (family.value && family.value !== metadata.familyName ? '\n注意：文件家庭与当前手动选择不同，请检查是否选错文件。' : '');
+  }));
+})();
