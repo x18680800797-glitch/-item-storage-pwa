@@ -541,3 +541,14 @@ h1 {
   transform: translateX(-50%) translateY(0);
   opacity: 1;
 }
+
+/* Manual backup: retain the existing header, cards and modal style. */
+.header-actions { display: flex; gap: 8px; align-items: center; }
+.backup-heading { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+.backup-note { color: var(--text-secondary); font-size: 13px; line-height: 1.6; margin: 12px 0; }
+.backup-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.backup-status { white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; margin: 16px 0; border-radius: 10px; background: var(--bg-primary); line-height: 1.6; font-size: 14px; }
+.backup-verify { border-top: 1px solid var(--border-color); padding-top: 16px; }
+#btn-backup-verify { margin-top: 10px; }
+#backup-modal button:disabled { opacity: 0.5; cursor: wait; }
+#backup-modal [hidden] { display: none; }
